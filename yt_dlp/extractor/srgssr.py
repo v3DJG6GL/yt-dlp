@@ -32,6 +32,7 @@ class SRGSSRIE(InfoExtractor):
     _ERRORS = {
         'AGERATING12': 'To protect children under the age of 12, this video is only available between 8 p.m. and 6 a.m.',
         'AGERATING18': 'To protect children under the age of 18, this video is only available between 11 p.m. and 5 a.m.',
+        # 'ENDDATE': 'For legal reasons, this video was only available for a specified period of time.',
         'GEOBLOCK': 'For legal reasons, this video is only available in Switzerland.',
         'LEGAL': 'The video cannot be transmitted for legal reasons.',
         'STARTDATE': 'This video is not yet available. Please try again later.',
