@@ -32,7 +32,6 @@ class SRGSSRIE(InfoExtractor):
     _ERRORS = {
         'AGERATING12': 'To protect children under the age of 12, this video is only available between 8 p.m. and 6 a.m.',
         'AGERATING18': 'To protect children under the age of 18, this video is only available between 11 p.m. and 5 a.m.',
-        # 'ENDDATE': 'For legal reasons, this video was only available for a specified period of time.',
         'GEOBLOCK': 'For legal reasons, this video is only available in Switzerland.',
         'LEGAL': 'The video cannot be transmitted for legal reasons.',
         'STARTDATE': 'This video is not yet available. Please try again later.',
@@ -55,17 +54,22 @@ class SRGSSRIE(InfoExtractor):
         return url
 
     def _get_media_data(self, bu, media_type, media_id):
+        query = {'onlyChapters': True} if media_type == 'video' else {}
         full_media_data = self._download_json(
             f'https://il.srgssr.ch/integrationlayer/2.0/{bu}/mediaComposition/{media_type}/{media_id}.json',
-            media_id)
+            media_id, query=query)
 
-        # Extract the chapter data
         chapter_list = full_media_data.get('chapterList', [])
+        if not chapter_list:
+            raise ExtractorError('No chapters found')
+
         try:
             media_data = next(
-                x for x in chapter_list if x.get('id') == media_id)
+                ch for ch in chapter_list
+                if ch.get('id') == media_id or ch.get('urn') == f'urn:{bu}:video:{media_id}'
+            )
         except StopIteration:
-            raise ExtractorError('No media information found')
+            media_data = chapter_list[0]
 
         block_reason = media_data.get('blockReason')
         if block_reason and block_reason in self._ERRORS:
@@ -73,46 +77,62 @@ class SRGSSRIE(InfoExtractor):
             if block_reason == 'GEOBLOCK':
                 self.raise_geo_restricted(
                     msg=message, countries=self._GEO_COUNTRIES)
-            raise ExtractorError(
-                f'{self.IE_NAME} said: {message}', expected=True)
+            raise ExtractorError(f'{self.IE_NAME} said: {message}', expected=True)
 
-        # Add episode, show, and analytics information to media_data
-        media_data['episode'] = full_media_data.get('episode', {})
-        media_data['show'] = full_media_data.get('show', {})
-        media_data['analyticsMetadata'] = full_media_data.get('analyticsMetadata', {})
-
-        return media_data
+        media_data['parentChapter'] = next(
+            (ch for ch in chapter_list if not ch.get('fullLengthUrn')),
+            chapter_list[0]
+        )
+        return media_data, full_media_data
 
     def _real_extract(self, url):
         bu, media_type, media_id = self._match_valid_url(url).groups()
-        media_data = self._get_media_data(bu, media_type, media_id)
-        title = media_data['title']
+        media_data, full_media_data = self._get_media_data(bu, media_type, media_id)
+
+        is_segment = bool(media_data.get('fullLengthUrn'))
+        mark_in = int_or_none(media_data.get('markIn'))
+        mark_out = int_or_none(media_data.get('markOut'))
 
         formats = []
         subtitles = {}
         q = qualities(['SD', 'HD'])
-        for source in (media_data.get('resourceList') or []):
+
+        resource_list = media_data.get('resourceList') or []
+        if not resource_list and is_segment:
+            resource_list = media_data.get('parentChapter', {}).get('resourceList', [])
+
+        for source in resource_list:
             format_url = source.get('url')
             if not format_url:
                 continue
+
             protocol = source.get('protocol')
             quality = source.get('quality')
             format_id = join_nonempty(protocol, source.get('encoding'), quality)
 
+            if is_segment and mark_in is not None and mark_out is not None:
+                start = mark_in / 1000
+                end = mark_out / 1000
+                if protocol == 'HLS' and '?' in format_url:
+                    base, query = format_url.split('?', 1)
+                    params = {}
+                    for param in query.split('&'):
+                        k, _, v = param.partition('=')
+                        params[k] = v
+                    params.update({'start': f'{start:.3f}', 'end': f'{end:.3f}'})
+                    format_url = f'{base}?{"&".join(f"{k}={v}" for k, v in params.items())}'
+
             if protocol in ('HDS', 'HLS'):
                 if source.get('tokenType') == 'AKAMAI':
-                    format_url = self._get_tokenized_src(
-                        format_url, media_id, format_id)
-                    fmts, subs = self._extract_akamai_formats_and_subtitles(
-                        format_url, media_id)
+                    format_url = self._get_tokenized_src(format_url, media_id, format_id)
+                    fmts, subs = self._extract_akamai_formats_and_subtitles(format_url, media_id)
                     formats.extend(fmts)
-                    subtitles = self._merge_subtitles(subtitles, subs)
+                    self._merge_subtitles(subtitles, subs)
                 elif protocol == 'HLS':
                     m3u8_fmts, m3u8_subs = self._extract_m3u8_formats_and_subtitles(
-                        format_url, media_id, 'mp4', 'm3u8_native',
-                        m3u8_id=format_id, fatal=False)
+                        format_url, media_id, 'mp4', 'm3u8_native', m3u8_id=format_id, fatal=False)
                     formats.extend(m3u8_fmts)
-                    subtitles = self._merge_subtitles(subtitles, m3u8_subs)
+                    self._merge_subtitles(subtitles, m3u8_subs)
             elif protocol in ('HTTP', 'HTTPS'):
                 formats.append({
                     'format_id': format_id,
@@ -120,59 +140,37 @@ class SRGSSRIE(InfoExtractor):
                     'quality': q(quality),
                 })
 
-        # This is needed because for audio medias the podcast url is usually
-        # always included, even if is only an audio segment and not the
-        # whole episode.
-        if int_or_none(media_data.get('position')) == 0:
+        if not is_segment and int_or_none(media_data.get('position')) == 0:
             for p in ('S', 'H'):
                 podcast_url = media_data.get(f'podcast{p}dUrl')
-                if not podcast_url:
-                    continue
-                quality = p + 'D'
-                formats.append({
-                    'format_id': 'PODCAST-' + quality,
-                    'url': podcast_url,
-                    'quality': q(quality),
-                })
+                if podcast_url:
+                    formats.append({
+                        'format_id': f'PODCAST-{p}D',
+                        'url': podcast_url,
+                        'quality': q(f'{p}D'),
+                    })
 
         if media_type == 'video':
-            for sub in (media_data.get('subtitleList') or []):
+            for sub in media_data.get('subtitleList', []):
                 sub_url = sub.get('url')
-                if not sub_url:
-                    continue
-                lang = sub.get('locale') or self._DEFAULT_LANGUAGE_CODES[bu]
-                subtitles.setdefault(lang, []).append({
-                    'url': sub_url,
-                })
+                if sub_url:
+                    lang = sub.get('locale') or self._DEFAULT_LANGUAGE_CODES[bu]
+                    subtitles.setdefault(lang, []).append({'url': sub_url})
 
-        # Extract the metadata fields
-        episode_data = media_data.get('episode', {})
-        show_data = media_data.get('show', {})
-        analytics_metadata = media_data.get('analyticsMetadata', {})
-
-        series = show_data.get('title')
-        season_number = int_or_none(episode_data.get('seasonNumber'))
-        episode_number = int_or_none(episode_data.get('number'))
-        upload_date = analytics_metadata.get('media_publication_date')
-
-        if upload_date:
-            upload_date = upload_date.replace('-', '')
         return {
             'id': media_id,
-            'title': title,
+            'title': media_data.get('title'),
             'description': media_data.get('description') or media_data.get('lead'),
             'timestamp': parse_iso8601(media_data.get('date')),
-            'thumbnail': media_data.get('imageUrl'),
             'duration': float_or_none(media_data.get('duration'), 1000),
-            'subtitles': subtitles,
+            'thumbnail': media_data.get('imageUrl'),
             'formats': formats,
-            'series': series,
-            'season_number': season_number,
-            'episode_number': episode_number,
-            'upload_date': upload_date,
+            'subtitles': subtitles,
+            'series': full_media_data.get('show', {}).get('title') or media_data.get('title'),
+            'season_number': int_or_none(full_media_data.get('episode', {}).get('seasonNumber')),
+            'episode_number': int_or_none(full_media_data.get('episode', {}).get('number')),
             'channel': media_data.get('vendor'),
         }
-
 
 class SRGSSRPlayIE(InfoExtractor):
     IE_DESC = 'srf.ch, rts.ch, rsi.ch, rtr.ch and swissinfo.ch play sites'
@@ -186,7 +184,6 @@ class SRGSSRPlayIE(InfoExtractor):
                         )
                         \?.*?\b(?:id=|urn=urn:[^:]+:video:)(?P<id>[0-9a-f\-]{36}|\d+)
                     '''
-
     _TESTS = [{
         'url': 'http://www.srf.ch/play/tv/10vor10/video/snowden-beantragt-asyl-in-russland?id=28e1a57d-5b76-4399-8ab3-9097f071e6c5',
         'md5': '6db2226ba97f62ad42ce09783680046c',
@@ -247,7 +244,7 @@ class SRGSSRPlayIE(InfoExtractor):
         'params': {
             'skip_download': True,
         },
-    # }, {
+    }, {
         'url': 'https://www.srf.ch/play/tv/popupvideoplayer?id=c4dba0ca-e75b-43b2-a34f-f708a4932e01',
         'only_matching': True,
     }, {
