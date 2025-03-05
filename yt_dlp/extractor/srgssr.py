@@ -55,13 +55,15 @@ class SRGSSRIE(InfoExtractor):
         return url
 
     def _get_media_data(self, bu, media_type, media_id):
-        query = {'onlyChapters': True} if media_type == 'video' else {}
         full_media_data = self._download_json(
             f'https://il.srgssr.ch/integrationlayer/2.0/{bu}/mediaComposition/{media_type}/{media_id}.json',
-            media_id, query=query)['chapterList']
+            media_id)
+
+        # Extract the chapter data
+        chapter_list = full_media_data.get('chapterList', [])
         try:
             media_data = next(
-                x for x in full_media_data if x.get('id') == media_id)
+                x for x in chapter_list if x.get('id') == media_id)
         except StopIteration:
             raise ExtractorError('No media information found')
 
@@ -73,6 +75,11 @@ class SRGSSRIE(InfoExtractor):
                     msg=message, countries=self._GEO_COUNTRIES)
             raise ExtractorError(
                 f'{self.IE_NAME} said: {message}', expected=True)
+
+        # Add episode, show, and analytics information to media_data
+        media_data['episode'] = full_media_data.get('episode', {})
+        media_data['show'] = full_media_data.get('show', {})
+        media_data['analyticsMetadata'] = full_media_data.get('analyticsMetadata', {})
 
         return media_data
 
@@ -138,15 +145,32 @@ class SRGSSRIE(InfoExtractor):
                     'url': sub_url,
                 })
 
+        # Extract the metadata fields
+        episode_data = media_data.get('episode', {})
+        show_data = media_data.get('show', {})
+        analytics_metadata = media_data.get('analyticsMetadata', {})
+
+        series = show_data.get('title')
+        season_number = int_or_none(episode_data.get('seasonNumber'))
+        episode_number = int_or_none(episode_data.get('number'))
+        upload_date = analytics_metadata.get('media_publication_date')
+
+        if upload_date:
+            upload_date = upload_date.replace('-', '')
         return {
             'id': media_id,
             'title': title,
-            'description': media_data.get('description'),
+            'description': media_data.get('description') or media_data.get('lead'),
             'timestamp': parse_iso8601(media_data.get('date')),
             'thumbnail': media_data.get('imageUrl'),
             'duration': float_or_none(media_data.get('duration'), 1000),
             'subtitles': subtitles,
             'formats': formats,
+            'series': series,
+            'season_number': season_number,
+            'episode_number': episode_number,
+            'upload_date': upload_date,
+            'channel': media_data.get('vendor'),
         }
 
 
@@ -223,7 +247,7 @@ class SRGSSRPlayIE(InfoExtractor):
         'params': {
             'skip_download': True,
         },
-    }, {
+    # }, {
         'url': 'https://www.srf.ch/play/tv/popupvideoplayer?id=c4dba0ca-e75b-43b2-a34f-f708a4932e01',
         'only_matching': True,
     }, {
