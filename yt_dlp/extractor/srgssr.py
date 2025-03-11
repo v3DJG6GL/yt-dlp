@@ -86,6 +86,43 @@ class SRGSSRIE(InfoExtractor):
         )
         return media_data, full_media_data
 
+    def _extract_m3u8_subtitles(self, m3u8_url, media_id):
+        """Extract subtitles directly from an m3u8 playlist."""
+        from urllib.parse import urljoin
+        import re
+
+        m3u8_content = self._download_webpage(m3u8_url, media_id, 'Downloading m3u8 playlist', fatal=False)
+        if not m3u8_content:
+            return {}
+
+        subtitles = {}
+
+        # Look for #EXT-X-MEDIA:TYPE=SUBTITLES lines
+        sub_entries = re.findall(r'#EXT-X-MEDIA:TYPE=SUBTITLES,(.*)', m3u8_content)
+        for entry in sub_entries:
+            # Parse the attributes of the subtitle entry
+            attrs = {}
+            for attr_match in re.finditer(r'([A-Z-]+)="([^"]*)"', entry):
+                attrs[attr_match.group(1)] = attr_match.group(2)
+
+            if 'URI' not in attrs or 'LANGUAGE' not in attrs:
+                continue
+
+            sub_url = attrs['URI']
+            # Make the URL absolute if it's not already
+            if not sub_url.startswith('http'):
+                sub_url = urljoin(m3u8_url, sub_url)
+
+            lang = attrs['LANGUAGE']
+            name = attrs.get('NAME', '')
+
+            subtitles.setdefault(lang, []).append({
+                'url': sub_url,
+                'name': name,
+            })
+
+        return subtitles
+
     def _real_extract(self, url):
         bu, media_type, media_id = self._match_valid_url(url).groups()
         media_data, full_media_data = self._get_media_data(bu, media_type, media_id)
@@ -134,6 +171,10 @@ class SRGSSRIE(InfoExtractor):
                         format_url, media_id, 'mp4', 'm3u8_native', m3u8_id=format_id, fatal=False)
                     formats.extend(m3u8_fmts)
                     self._merge_subtitles(subtitles, m3u8_subs)
+
+                    # Also try to extract subtitles directly from the m3u8 playlist
+                    direct_m3u8_subs = self._extract_m3u8_subtitles(format_url, media_id)
+                    subtitles = self._merge_subtitles(subtitles, direct_m3u8_subs)
             elif protocol in ('HTTP', 'HTTPS'):
                 formats.append({
                     'format_id': format_id,
@@ -141,22 +182,30 @@ class SRGSSRIE(InfoExtractor):
                     'quality': q(quality),
                 })
 
-        if not is_segment and int_or_none(media_data.get('position')) == 0:
+        # This is needed because for audio medias the podcast url is usually
+        # always included, even if is only an audio segment and not the
+        # whole episode.
+        if int_or_none(media_data.get('position')) == 0:
             for p in ('S', 'H'):
                 podcast_url = media_data.get(f'podcast{p}dUrl')
-                if podcast_url:
-                    formats.append({
-                        'format_id': f'PODCAST-{p}D',
-                        'url': podcast_url,
-                        'quality': q(f'{p}D'),
-                    })
+                if not podcast_url:
+                    continue
+                quality = p + 'D'
+                formats.append({
+                    'format_id': 'PODCAST-' + quality,
+                    'url': podcast_url,
+                    'quality': q(quality),
+                })
 
         if media_type == 'video':
-            for sub in media_data.get('subtitleList', []):
+            for sub in (media_data.get('subtitleList') or []):
                 sub_url = sub.get('url')
-                if sub_url:
-                    lang = sub.get('locale') or self._DEFAULT_LANGUAGE_CODES[bu]
-                    subtitles.setdefault(lang, []).append({'url': sub_url})
+                if not sub_url:
+                    continue
+                lang = sub.get('locale') or self._DEFAULT_LANGUAGE_CODES[bu]
+                subtitles.setdefault(lang, []).append({
+                    'url': sub_url,
+                })
 
         return {
             'id': media_id,
